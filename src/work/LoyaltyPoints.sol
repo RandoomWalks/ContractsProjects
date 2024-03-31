@@ -16,7 +16,8 @@ contract LoyaltyPoints {
 
     // Events for logging activities on the contract
     event PointsEarned(address indexed user, uint points);
-    event PointsRedeemed(address indexed user, uint points);
+    event PointsRedeemed(address indexed user, uint points, uint redeemRate);
+    event RedeemRateUpdated(uint newRedeemRate);
 
     // Modifier to restrict certain actions to the owner of the contract
     modifier onlyOwner() {
@@ -34,6 +35,7 @@ contract LoyaltyPoints {
     constructor() {
         owner = msg.sender;
         admins[msg.sender] = true;
+        redeemRate = _initialRedeemRate; // Set initial redeem rate at contract deployment
     }
 
     // Allows the owner to add a new admin
@@ -65,16 +67,30 @@ contract LoyaltyPoints {
     function redeemPoints(uint _points) public {
         require(pointsBalance[msg.sender] >= _points, "Insufficient points");
         require(_points > 0, "Points to redeem must be greater than 0");
-        
+
+        uint etherToTransfer = _points * redeemRate;
+        // Check that the contract has enough Ether to cover the redemption
+        require(address(this).balance >= etherToTransfer, "Contract has insufficient balance for this redemption");
+            
         pointsBalance[msg.sender] -= _points; // Deduct points from the user's balance
         totalPoints -= _points; // Adjust the total points issued after redemption
 
-        uint etherToTransfer = _points * redeemRate; // Calculate ether amount
-        payable(msg.sender).transfer(etherToTransfer); // Transfer ether to the user
+        (bool success, ) = payable(msg.sender).transfer(etherToTransfer); // Transfer ether to the user
+        require(success, "Ether transfer failed");
 
-        emit PointsRedeemed(msg.sender, _points);
+        emit PointsRedeemed(msg.sender, _points, redeemRate);
     }
 
+    /**
+     * @dev Allows the owner to update the redeem rate.
+     * @param _newRedeemRate The new rate at which points will be redeemed for ether.
+     */
+    function updateRedeemRate(uint _newRedeemRate) public onlyOwner {
+        require(_newRedeemRate > 0, "Redeem rate must be greater than 0");
+        redeemRate = _newRedeemRate;
+        emit RedeemRateUpdated(_newRedeemRate);
+    }
+    
     // Allows the owner to deposit ether into the contract. This ether is used for point redemption.
     function depositEther() public payable onlyOwner {}
 

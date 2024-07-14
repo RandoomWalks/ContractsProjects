@@ -6,12 +6,17 @@ import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Counters.sol";
 import "@litprotocol/contracts/LitAccessControl.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
 
 // Main contract for managing a poker game
 contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl {
     using Counters for Counters.Counter; // Using Counters for managing unique game IDs
 
     Counters.Counter private _gameIds; // Counter for game IDs
+
+    bytes32 public constant PLAYER_ROLE = keccak256("PLAYER_ROLE");
+    bytes32 public constant CURRENT_TURN_ROLE = keccak256("CURRENT_TURN_ROLE");
+    bytes32 public constant DEALER_ROLE = keccak256("DEALER_ROLE");
 
     uint8 constant MAX_PLAYERS = 6; // Maximum number of players per game
     uint256 constant INITIAL_CHIP_COUNT = 1000; // Initial chip count for each player
@@ -27,6 +32,8 @@ contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl {
         uint256 chipCount; // Player's chip count
         PlayerAction lastAction; // Player's last action
         bool isActive; // Whether the player is active in the game
+        bool hasPlayerRole;
+        bool hasCurrentTurnRole;
     }
 
     // Struct representing a poker game
@@ -54,7 +61,9 @@ contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl {
     event GameEnded(uint256 indexed gameId, address winner, uint256 pot); // Event for game ending
 
     // Constructor for initializing the ERC721 token
-    constructor() ERC721("PokerGame", "PKR") {}
+    constructor() ERC721("PokerGame", "PKR") {
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+    }
 
     // Function to create a new game
     function createGame() external returns (uint256) {
@@ -83,9 +92,12 @@ contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl {
             addr: msg.sender,
             chipCount: INITIAL_CHIP_COUNT,
             lastAction: PlayerAction.NONE,
-            isActive: true
+            isActive: true,
+            hasPlayerRole: true,
+            hasCurrentTurnRole: false
         });
         game.playerCount++; // Increment the player count
+        _grantRole(PLAYER_ROLE, msg.sender);
 
         emit PlayerJoined(gameId, msg.sender); // Emit the PlayerJoined event
 
@@ -107,6 +119,10 @@ contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl {
         game.bigBlindIndex = (game.smallBlindIndex + 1) % game.playerCount; // Set the big blind index
         game.currentPlayerIndex = (game.bigBlindIndex + 1) % game.playerCount; // Set the current player index
 
+        address firstPlayer = game.players[game.currentPlayerIndex].addr;
+        _grantRole(CURRENT_TURN_ROLE, firstPlayer);
+        game.players[game.currentPlayerIndex].hasCurrentTurnRole = true;
+        
         // Collect blinds from the small and big blind players
         collectBlind(gameId, game.smallBlindIndex, 1);
         collectBlind(gameId, game.bigBlindIndex, 2);
@@ -129,13 +145,29 @@ contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl {
         emit PlayerAction(gameId, player.addr, PlayerAction.CALL, blindAmount); // Emit the PlayerAction event
     }
 
+    function grantPlayerRole(address player, uint256 gameId) internal {
+        _grantRole(PLAYER_ROLE, player);
+    }
+
+    function revokePlayerRole(address player) internal {
+        _revokeRole(PLAYER_ROLE, player);
+    }
+
+    function grantDealerRole(address dealer) internal {
+        _grantRole(DEALER_ROLE, dealer);
+    }
+
     // Function for a player to place a bet
-    function placeBet(uint256 gameId, uint256 amount) external nonReentrant {
+    function placeBet(uint256 gameId, uint256 amount) external nonReentrant onlyRole(PLAYER_ROLE) {
+        require(hasRole(PLAYER_ROLE, msg.sender), "Not a player in this game");
+        require(hasRole(CURRENT_TURN_ROLE, msg.sender), "Not your turn");
+
         Game storage game = games[gameId]; // Get the game from storage
         require(game.state == GameState.ACTIVE, "Game not active"); // Ensure the game is in the ACTIVE state
         require(msg.sender == game.players[game.currentPlayerIndex].addr, "Not your turn"); // Ensure it is the player's turn
 
         Player storage currentPlayer = game.players[game.currentPlayerIndex]; // Get the current player
+        require(currentPlayer.addr == msg.sender, "Player mismatch");
         require(currentPlayer.chipCount >= amount, "Not enough chips"); // Ensure the player has enough chips
         require(amount >= game.highestBet - getPlayerBet(gameId, msg.sender), "Bet too low"); // Ensure the bet is at least the highest bet
 
@@ -171,6 +203,11 @@ contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl {
     // Internal function to move to the next turn
     function nextTurn(uint256 gameId) internal {
         Game storage game = games[gameId]; // Get the game from storage
+            Player storage currentPlayer = game.players[game.currentPlayerIndex];
+
+        _revokeRole(CURRENT_TURN_ROLE, currentPlayer.addr);
+        currentPlayer.hasCurrentTurnRole = false;
+
         uint8 nextPlayerIndex = (game.currentPlayerIndex + 1) % game.playerCount; // Calculate the next player index
 
         while (!game.players[nextPlayerIndex].isActive) { // Find the next active player
@@ -178,6 +215,10 @@ contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl {
         }
 
         game.currentPlayerIndex = nextPlayerIndex; // Set the current player index to the next active player
+        Player storage nextPlayer = game.players[nextPlayerIndex];
+
+        _grantRole(CURRENT_TURN_ROLE, nextPlayer.addr);
+        nextPlayer.hasCurrentTurnRole = true;
 
         if (isRoundComplete(gameId)) {
             // Handle end of betting round logic here
@@ -220,6 +261,16 @@ contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl {
             }
         }
         revert("Player not found"); // Revert if the player is not found
+    }
+    
+    function hasCurrentTurn(uint256 gameId, address player) public view returns (bool) {
+        Game storage game = games[gameId];
+        for (uint8 i = 0; i < game.playerCount; i++) {
+            if (game.players[i].addr == player) {
+                return game.players[i].hasCurrentTurnRole;
+            }
+        }
+        return false;
     }
 
     // Additional functions for game logic, hand evaluation, and game conclusion would be implemented here

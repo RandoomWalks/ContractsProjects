@@ -45,17 +45,6 @@ contract PokerHandManagement is LitAccessControl {
         deck.topCard = 0; // Reset the top card index
     }
 
-    // Function to shuffle the deck for a game
-    function shuffleDeck(uint256 gameId) internal {
-        Deck storage deck = decks[gameId]; // Get the deck for the given game ID
-        for (uint8 i = 51; i > 0; i--) { // Loop through the deck in reverse order
-            uint8 j = uint8(uint256(keccak256(abi.encodePacked(block.timestamp, block.difficulty, i))) % (i + 1)); // Generate a random index
-            Card memory temp = deck.cards[i]; // Swap the current card with the random card
-            deck.cards[i] = deck.cards[j];
-            deck.cards[j] = temp;
-        }
-    }
-
     // Function to deal a hand to a player
     function dealHand(uint256 gameId, address player) internal {
         Deck storage deck = decks[gameId]; // Get the deck for the given game ID

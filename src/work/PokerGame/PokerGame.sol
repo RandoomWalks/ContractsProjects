@@ -9,8 +9,9 @@ import "@litprotocol/contracts/LitAccessControl.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 
 // Main contract for managing a poker game
-contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl, VRFConsumerBaseV2 {
+contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl, VRFConsumerBaseV2, AccessControl {
     using Counters for Counters.Counter; // Using Counters for managing unique game IDs
+    using ECDSA for bytes32;
 
     Counters.Counter private _gameIds; // Counter for game IDs
 
@@ -25,6 +26,8 @@ contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl, VRFConsumerBase
     // Mapping to store VRF requests
     mapping(uint256 => uint256) private vrfRequests;
 
+    mapping(bytes32 => bool) private revealedCards;
+
     // Note: The callbackGasLimit may need to be adjusted based on the complexity of your shuffleDeck function
     uint32 callbackGasLimit = 200000;
 
@@ -32,11 +35,28 @@ contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl, VRFConsumerBase
     bytes32 public constant CURRENT_TURN_ROLE = keccak256("CURRENT_TURN_ROLE");
     bytes32 public constant DEALER_ROLE = keccak256("DEALER_ROLE");
 
+   // Struct to represent community cards
+    struct CommunityCards {
+        bytes32 flop1Commitment;
+        bytes32 flop2Commitment;
+        bytes32 flop3Commitment;
+        bytes32 turnCommitment;
+        bytes32 riverCommitment;
+        Card flop1;
+        Card flop2;
+        Card flop3;
+        Card turn;
+        Card river;
+        bool flopRevealed;
+        bool turnRevealed;
+        bool riverRevealed;
+    }
+
     uint8 constant MAX_PLAYERS = 6; // Maximum number of players per game
     uint256 constant INITIAL_CHIP_COUNT = 1000; // Initial chip count for each player
 
     // Enum representing the possible states of the game
-    enum GameState { WAITING, SHUFFLING, ACTIVE, FINISHED }
+    enum GameState { WAITING, SHUFFLING, ACTIVE, REVEALING_COMMUNITY_CARDS, FINISHED }
 
     // Enum representing the possible actions a player can take
     enum PlayerAction { NONE, CALL, RAISE, FOLD }
@@ -63,6 +83,8 @@ contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl, VRFConsumerBase
         uint8 dealerIndex; // Index of the dealer
         uint8 smallBlindIndex; // Index of the small blind
         uint8 bigBlindIndex; // Index of the big blind
+        address dealer;
+        CommunityCards communityCards;
     }
 
     mapping(uint256 => Game) public games; // Mapping of game IDs to Game structs
@@ -80,12 +102,22 @@ contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl, VRFConsumerBase
     event DeckShuffled(uint256 indexed gameId);
     // Constructor for initializing the ERC721 token
     event VRFRequestFailed(uint256 indexed gameId, string reason);
+    // Event for card commitment
+    event CardCommitted(uint256 indexed gameId, string position, bytes32 commitment);
+    // Event for card revelation
+    event CardRevealed(uint256 indexed gameId, string position, uint8 rank, uint8 suit);
+    event DealerAssigned(uint256 indexed gameId, address dealer);
+
 
     modifier onlyGameCreator(uint256 gameId) {
         require(games[gameId].creator == msg.sender, "Only game creator can start the game");
         _;
     }
-
+    // Modifier to restrict access to the assigned dealer
+    modifier onlyDealer(uint256 gameId) {
+        require(msg.sender == games[gameId].dealer, "Only the assigned dealer can perform this action");
+        _;
+    }
     constructor(uint64 subscriptionId) ERC721("PokerGame", "PKR")
         VRFConsumerBaseV2(0x2Ca8E0C643bDe4C2E08ab1fA0da3401AdAD7734D) // VRF Coordinator address (Sepolia)
     {
@@ -93,6 +125,14 @@ contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl, VRFConsumerBase
         COORDINATOR = VRFCoordinatorV2Interface(0x2Ca8E0C643bDe4C2E08ab1fA0da3401AdAD7734D);
         s_subscriptionId = subscriptionId;
         keyHash = 0x474e34a077df58807dbe9c96d3c009b23b3c6d0cce433e59bbf5b34f823bc56c; // Sepolia key hash
+        _setupRole(DEALER_ROLE, msg.sender); // Set the contract deployer as the initial dealer
+    }
+
+    // Function to assign a dealer to a game
+    function assignDealer(uint256 gameId, address dealer) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(hasRole(DEALER_ROLE, dealer), "Address is not a dealer");
+        games[gameId].dealer = dealer;
+        emit DealerAssigned(gameId, dealer);
     }
 
     // Function to create a new game
@@ -352,6 +392,124 @@ contract PokerGame is ERC721, ReentrancyGuard, LitAccessControl, VRFConsumerBase
             }
         }
         return false;
+    }
+    function getCommunityCards(uint256 gameId) external view returns (Card[5] memory) {
+        Game storage game = games[gameId];
+        return [
+            game.communityCards.flop1,
+            game.communityCards.flop2,
+            game.communityCards.flop3,
+            game.communityCards.turn,
+            game.communityCards.river
+        ];
+    }
+    // Function for the dealer to commit community cards
+    function commitCommunityCards(
+        uint256 gameId, 
+        bytes32 flop1, 
+        bytes32 flop2, 
+        bytes32 flop3, 
+        bytes32 turn, 
+        bytes32 river
+    ) external onlyDealer(gameId) {
+        Game storage game = games[gameId];
+        require(game.state == GameState.ACTIVE, "Game not active");
+
+        game.communityCards.flop1Commitment = flop1;
+        game.communityCards.flop2Commitment = flop2;
+        game.communityCards.flop3Commitment = flop3;
+        game.communityCards.turnCommitment = turn;
+        game.communityCards.riverCommitment = river;
+
+        emit CardCommitted(gameId, "flop1", flop1);
+        emit CardCommitted(gameId, "flop2", flop2);
+        emit CardCommitted(gameId, "flop3", flop3);
+        emit CardCommitted(gameId, "turn", turn);
+        emit CardCommitted(gameId, "river", river);
+    }
+
+    // Function to reveal the flop
+    function revealFlop(
+        uint256 gameId, 
+        uint8[3] memory ranks, 
+        uint8[3] memory suits, 
+        bytes[3] memory signatures
+    ) external onlyDealer(gameId) {
+        Game storage game = games[gameId];
+        require(game.state == GameState.ACTIVE, "Game not active");
+        require(!game.communityCards.flopRevealed, "Flop already revealed");
+        game.state = GameState.REVEALING_COMMUNITY_CARDS;
+
+        verifyAndSetCard(gameId, "flop1", ranks[0], suits[0], signatures[0]);
+        verifyAndSetCard(gameId, "flop2", ranks[1], suits[1], signatures[1]);
+        verifyAndSetCard(gameId, "flop3", ranks[2], suits[2], signatures[2]);
+        require(game.communityCards.flop1Commitment != bytes32(0), "Flop not committed");
+
+        game.communityCards.flopRevealed = true;
+        game.state = GameState.ACTIVE;
+    }
+
+    // Function to reveal the turn
+    function revealTurn(uint256 gameId, uint8 rank, uint8 suit, bytes memory signature) external onlyDealer(gameId) {
+        Game storage game = games[gameId];
+        require(game.state == GameState.ACTIVE, "Game not active");
+        require(game.communityCards.flopRevealed, "Flop not yet revealed");
+        require(!game.communityCards.turnRevealed, "Turn already revealed");
+
+
+        verifyAndSetCard(gameId, "turn", rank, suit, signature);
+
+        game.communityCards.turnRevealed = true;
+    }
+
+    // Function to reveal the river
+    function revealRiver(uint256 gameId, uint8 rank, uint8 suit, bytes memory signature) external onlyDealer(gameId) {
+        Game storage game = games[gameId];
+        require(game.state == GameState.ACTIVE, "Game not active");
+        require(game.communityCards.turnRevealed, "Turn not yet revealed");
+        require(!game.communityCards.riverRevealed, "River already revealed");
+
+        verifyAndSetCard(gameId, "river", rank, suit, signature);
+
+        game.communityCards.riverRevealed = true;
+    }
+
+    // Internal function to verify and set a community card
+    function verifyAndSetCard(uint256 gameId, string memory position, uint8 rank, uint8 suit, bytes memory signature) internal {
+        Game storage game = games[gameId];
+        bytes32 commitment;
+        Card storage card;
+
+        if (keccak256(abi.encodePacked(position)) == keccak256(abi.encodePacked("flop1"))) {
+            commitment = game.communityCards.flop1Commitment;
+            card = game.communityCards.flop1;
+        } else if (keccak256(abi.encodePacked(position)) == keccak256(abi.encodePacked("flop2"))) {
+            commitment = game.communityCards.flop2Commitment;
+            card = game.communityCards.flop2;
+        } else if (keccak256(abi.encodePacked(position)) == keccak256(abi.encodePacked("flop3"))) {
+            commitment = game.communityCards.flop3Commitment;
+            card = game.communityCards.flop3;
+        } else if (keccak256(abi.encodePacked(position)) == keccak256(abi.encodePacked("turn"))) {
+            commitment = game.communityCards.turnCommitment;
+            card = game.communityCards.turn;
+        } else if (keccak256(abi.encodePacked(position)) == keccak256(abi.encodePacked("river"))) {
+            commitment = game.communityCards.riverCommitment;
+            card = game.communityCards.river;
+        } else {
+            revert("Invalid position");
+        }
+
+        bytes32 hash = keccak256(abi.encodePacked(rank, suit));
+        require(hash.toEthSignedMessageHash().recover(signature) == game.dealer, "Invalid signature");
+        require(commitment == hash, "Commitment does not match revealed card");
+        require(!revealedCards[cardHash], "Card already revealed");
+        revealedCards[cardHash] = true;
+        
+        card.rank = rank;
+        card.suit = suit;
+
+
+        emit CardRevealed(gameId, position, rank, suit);
     }
 
     // Additional functions for game logic, hand evaluation, and game conclusion would be implemented here
